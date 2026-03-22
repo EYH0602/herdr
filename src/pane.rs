@@ -1,0 +1,370 @@
+use std::io::{BufWriter, Read, Write};
+use std::cell::Cell;
+use std::sync::{
+    atomic::{AtomicBool, AtomicU32, Ordering},
+    Arc, RwLock,
+};
+
+use bytes::Bytes;
+use portable_pty::{native_pty_system, CommandBuilder, PtySize};
+use tokio::sync::mpsc;
+use tracing::{debug, error, info, warn};
+
+use crate::detect::{Agent, AgentState};
+use crate::events::AppEvent;
+use crate::layout::PaneId;
+use crate::pty_callbacks::PtyResponses;
+
+// ---------------------------------------------------------------------------
+// PaneState — pure data, constructable without PTYs, testable
+// ---------------------------------------------------------------------------
+
+/// Observable state for a single pane.
+/// This is the only part of a pane that workspace logic and tests need.
+pub struct PaneState {
+    pub detected_agent: Option<Agent>,
+    pub state: AgentState,
+    /// Whether the user has seen this pane since its last state change to Idle.
+    /// False = "Done" (agent finished while user was in another workspace).
+    pub seen: bool,
+}
+
+impl PaneState {
+    pub fn new() -> Self {
+        Self {
+            detected_agent: None,
+            state: AgentState::Unknown,
+            seen: true,
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// PaneRuntime — PTY, parser, channels, background tasks
+// ---------------------------------------------------------------------------
+
+/// PTY runtime for a pane. Owns the terminal, I/O channels, and background tasks.
+/// Dropping this shuts down all background tasks and closes the PTY.
+pub struct PaneRuntime {
+    pub parser: Arc<RwLock<vt100::Parser<PtyResponses>>>,
+    pub sender: mpsc::Sender<Bytes>,
+    resize_tx: mpsc::Sender<(u16, u16)>,
+    current_size: Cell<(u16, u16)>,
+    child_pid: Arc<AtomicU32>,
+    pub kitty_keyboard: Arc<AtomicBool>,
+    /// Live screen content snapshot — updated by reader, read by detector.
+    /// Decouples detection from parser viewport state (scrollback).
+    /// Kept alive here so the Arc isn't dropped; tasks hold their own clones.
+    #[allow(dead_code)]
+    screen_content: Arc<RwLock<String>>,
+    // Task handles for deterministic shutdown
+    detect_handle: tokio::task::AbortHandle,
+}
+
+impl Drop for PaneRuntime {
+    fn drop(&mut self) {
+        // Abort detection task immediately.
+        // Reader/writer/resize tasks shut down naturally via channel close
+        // and PTY EOF when the rest of PaneRuntime is dropped.
+        self.detect_handle.abort();
+    }
+}
+
+impl PaneRuntime {
+    pub fn spawn(
+        pane_id: PaneId,
+        rows: u16,
+        cols: u16,
+        cwd: std::path::PathBuf,
+        events: mpsc::Sender<AppEvent>,
+    ) -> std::io::Result<Self> {
+        let pty_system = native_pty_system();
+        let pair = pty_system
+            .openpty(PtySize {
+                rows,
+                cols,
+                pixel_width: 0,
+                pixel_height: 0,
+            })
+            .map_err(|e| std::io::Error::other(e.to_string()))?;
+
+        let responses = PtyResponses::new();
+        let kitty_keyboard = responses.kitty_keyboard.clone();
+        let parser = Arc::new(RwLock::new(vt100::Parser::new_with_callbacks(
+            rows, cols, 10000, responses.clone(),
+        )));
+
+        let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".into());
+        let mut cmd = CommandBuilder::new(&shell);
+        cmd.cwd(cwd);
+
+        let reader = pair
+            .master
+            .try_clone_reader()
+            .map_err(|e| std::io::Error::other(e.to_string()))?;
+        let writer = pair
+            .master
+            .take_writer()
+            .map_err(|e| std::io::Error::other(e.to_string()))?;
+
+        // --- Child watcher task ---
+        let child_pid = Arc::new(AtomicU32::new(0));
+        {
+            let child_pid = child_pid.clone();
+            let slave = pair.slave;
+            let events = events.clone();
+            let rt = tokio::runtime::Handle::current();
+            tokio::task::spawn_blocking(move || {
+                match slave.spawn_command(cmd) {
+                    Ok(mut child) => {
+                        if let Some(pid) = child.process_id() {
+                            child_pid.store(pid, Ordering::Release);
+                            info!(pane = pane_id.raw(), pid, "child spawned");
+                        }
+                        match child.wait() {
+                            Ok(status) => info!(pane = pane_id.raw(), ?status, "child exited"),
+                            Err(e) => error!(pane = pane_id.raw(), err = %e, "child wait failed"),
+                        }
+                    }
+                    Err(e) => error!(pane = pane_id.raw(), err = %e, "failed to spawn shell"),
+                }
+                // Use blocking send — PaneDied is critical, must not be dropped
+                if let Err(e) = rt.block_on(events.send(AppEvent::PaneDied { pane_id })) {
+                    error!(pane = pane_id.raw(), err = %e, "failed to send PaneDied event");
+                }
+            });
+        }
+
+        // --- Writer channel ---
+        let (input_tx, mut input_rx) = mpsc::channel::<Bytes>(32);
+
+        // Live screen snapshot for detection (decoupled from parser scrollback)
+        let screen_content = Arc::new(RwLock::new(String::new()));
+
+        // --- Reader task: PTY → parser + screen snapshot + terminal query responses ---
+        {
+            let mut reader = reader;
+            let parser = parser.clone();
+            let screen_content = screen_content.clone();
+            let response_writer = input_tx.clone();
+            tokio::task::spawn_blocking(move || {
+                let mut buf = [0u8; 8192];
+                loop {
+                    match reader.read(&mut buf) {
+                        Ok(0) => break,
+                        Err(e) => {
+                            debug!(pane = pane_id.raw(), err = %e, "pty reader closed");
+                            break;
+                        }
+                        Ok(n) => {
+                            if let Ok(mut p) = parser.write() {
+                                p.process(&buf[..n]);
+                                // Snapshot live screen content for detection.
+                                // Always reads at scrollback 0 (current view),
+                                // without touching the user's scroll position.
+                                let scrollback = p.screen().scrollback();
+                                if scrollback > 0 {
+                                    p.screen_mut().set_scrollback(0);
+                                }
+                                let content = p.screen().contents();
+                                if scrollback > 0 {
+                                    p.screen_mut().set_scrollback(scrollback);
+                                }
+                                if let Ok(mut sc) = screen_content.write() {
+                                    *sc = content;
+                                }
+                            } else {
+                                error!(pane = pane_id.raw(), "parser lock poisoned in reader");
+                                break;
+                            }
+                            let resp = responses.take();
+                            if !resp.is_empty() {
+                                if let Err(e) = response_writer.try_send(Bytes::from(resp)) {
+                                    warn!(pane = pane_id.raw(), err = %e, "dropped terminal query response");
+                                }
+                            }
+                        }
+                    }
+                }
+                debug!(pane = pane_id.raw(), "reader task exiting");
+            });
+        }
+
+        // --- Detection task ---
+        let detect_handle = {
+            use crate::detect;
+            use std::time::{Duration, Instant};
+
+            const TICK_UNIDENTIFIED: Duration = Duration::from_millis(500);
+            const TICK_IDENTIFIED: Duration = Duration::from_millis(300);
+            const PROCESS_RECHECK: Duration = Duration::from_secs(5);
+
+            let child_pid = child_pid.clone();
+            let screen_content = screen_content.clone();
+            let state_events = events.clone();
+
+            let handle = tokio::spawn(async move {
+                let mut agent: Option<Agent> = None;
+                let mut state = AgentState::Unknown;
+                let mut last_process_check = Instant::now();
+
+                tokio::time::sleep(Duration::from_millis(50)).await;
+
+                loop {
+                    let tick = if agent.is_none() {
+                        TICK_UNIDENTIFIED
+                    } else {
+                        TICK_IDENTIFIED
+                    };
+                    tokio::time::sleep(tick).await;
+
+                    let now = Instant::now();
+                    let should_check_process = agent.is_none()
+                        || now.duration_since(last_process_check) >= PROCESS_RECHECK;
+
+                    let mut agent_changed = false;
+                    if should_check_process {
+                        last_process_check = now;
+                        let pid = child_pid.load(Ordering::Acquire);
+                        if pid > 0 {
+                            if let Some(name) = detect::foreground_process_name(pid) {
+                                let new_agent = detect::identify_agent(&name);
+                                if new_agent != agent {
+                                    info!(
+                                        pane = pane_id.raw(),
+                                        ?new_agent,
+                                        process = %name,
+                                        "agent changed"
+                                    );
+                                    agent = new_agent;
+                                    agent_changed = true;
+                                }
+                            }
+                        }
+                    }
+
+                    let new_state = if let Ok(content) = screen_content.read() {
+                        detect::detect_state(agent, &content)
+                    } else {
+                        continue;
+                    };
+
+                    if new_state != state || agent_changed {
+                        debug!(
+                            pane = pane_id.raw(),
+                            ?state,
+                            ?new_state,
+                            ?agent,
+                            "state changed"
+                        );
+                        state = new_state;
+                        if let Err(e) = state_events.try_send(AppEvent::StateChanged {
+                            pane_id,
+                            agent,
+                            state: new_state,
+                        }) {
+                            warn!(
+                                pane = pane_id.raw(),
+                                err = %e,
+                                "dropped StateChanged event"
+                            );
+                        }
+                    }
+                }
+            });
+            handle.abort_handle()
+        };
+
+        // --- Writer task: channel → PTY ---
+        {
+            let mut writer = BufWriter::new(writer);
+            tokio::task::spawn_blocking(move || {
+                let rt = tokio::runtime::Handle::current();
+                while let Some(bytes) = rt.block_on(input_rx.recv()) {
+                    if let Err(e) = writer.write_all(&bytes) {
+                        warn!(pane = pane_id.raw(), err = %e, "pty write failed");
+                        break;
+                    }
+                    if let Err(e) = writer.flush() {
+                        warn!(pane = pane_id.raw(), err = %e, "pty flush failed");
+                        break;
+                    }
+                }
+                debug!(pane = pane_id.raw(), "writer task exiting");
+            });
+        }
+
+        // --- Resize task ---
+        let (resize_tx, mut resize_rx) = mpsc::channel::<(u16, u16)>(4);
+        {
+            let master = pair.master;
+            tokio::task::spawn_blocking(move || {
+                let rt = tokio::runtime::Handle::current();
+                while let Some((rows, cols)) = rt.block_on(resize_rx.recv()) {
+                    if let Err(e) = master.resize(PtySize {
+                        rows,
+                        cols,
+                        pixel_width: 0,
+                        pixel_height: 0,
+                    }) {
+                        warn!(pane = pane_id.raw(), err = %e, rows, cols, "pty resize failed");
+                    }
+                }
+            });
+        }
+
+        Ok(Self {
+            parser,
+            sender: input_tx,
+            resize_tx,
+            current_size: Cell::new((rows, cols)),
+            child_pid,
+            kitty_keyboard,
+            screen_content,
+            detect_handle,
+        })
+    }
+
+    /// Resize if the dimensions actually changed.
+    pub fn resize(&self, rows: u16, cols: u16) {
+        let rows = rows.max(2);
+        let cols = cols.max(4);
+        if self.current_size.get() == (rows, cols) {
+            return;
+        }
+        self.current_size.set((rows, cols));
+        if let Ok(mut p) = self.parser.write() {
+            p.screen_mut().set_size(rows, cols);
+        }
+        let _ = self.resize_tx.try_send((rows, cols));
+    }
+
+    /// Scroll up by N lines (into scrollback history).
+    pub fn scroll_up(&self, lines: usize) {
+        if let Ok(mut p) = self.parser.write() {
+            let current = p.screen().scrollback();
+            p.screen_mut().set_scrollback(current + lines);
+        }
+    }
+
+    /// Scroll down by N lines (toward live output).
+    pub fn scroll_down(&self, lines: usize) {
+        if let Ok(mut p) = self.parser.write() {
+            let current = p.screen().scrollback();
+            p.screen_mut().set_scrollback(current.saturating_sub(lines));
+        }
+    }
+
+    /// Reset scroll to live view (offset = 0).
+    pub fn scroll_reset(&self) {
+        if let Ok(mut p) = self.parser.write() {
+            p.screen_mut().set_scrollback(0);
+        }
+    }
+
+    /// Get the current working directory of the child shell process.
+    pub fn cwd(&self) -> Option<std::path::PathBuf> {
+        let pid = self.child_pid.load(Ordering::Relaxed);
+        crate::platform::process_cwd(pid)
+    }
+}
