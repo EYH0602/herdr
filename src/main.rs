@@ -20,6 +20,7 @@ const NESTED_HERDR_MESSAGES: [&str; 6] = [
 
 mod api;
 mod app;
+mod cli;
 mod config;
 mod detect;
 mod events;
@@ -149,6 +150,10 @@ fn random_nested_message() -> &'static str {
 fn main() -> io::Result<()> {
     let args: Vec<String> = std::env::args().collect();
 
+    if let cli::CommandOutcome::Handled(code) = cli::maybe_run(&args)? {
+        std::process::exit(code);
+    }
+
     // Subcommands and flags (no TUI, no logging needed)
     if args.get(1).map(|s| s.as_str()) == Some("update") {
         match update::self_update() {
@@ -165,9 +170,15 @@ fn main() -> io::Result<()> {
         println!();
         println!("Usage: herdr [options]");
         println!("       herdr update");
+        println!("       herdr workspace <subcommand> ...");
+        println!("       herdr pane <subcommand> ...");
+        println!("       herdr wait <subcommand> ...");
         println!();
         println!("Commands:");
         println!("  update              Download and install the latest version");
+        println!("  workspace           workspace helpers over the socket api");
+        println!("  pane                pane control helpers over the socket api");
+        println!("  wait                blocking wait helpers over the socket api");
         println!();
         println!("Options:");
         println!("  --no-session        Don't restore or save sessions");
@@ -206,7 +217,8 @@ fn main() -> io::Result<()> {
             eprintln!("run 'herdr --help' for usage");
             std::process::exit(1);
         }
-        if !arg.starts_with('-') && arg != "update" {
+        if !arg.starts_with('-') && !["update", "workspace", "pane", "wait"].contains(&arg.as_str())
+        {
             eprintln!("unknown command: {arg}");
             eprintln!("run 'herdr --help' for usage");
             std::process::exit(1);

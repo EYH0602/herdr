@@ -1,0 +1,327 @@
+use std::fs;
+use std::io::{BufRead, BufReader, Write};
+use std::os::unix::net::UnixStream;
+use std::path::{Path, PathBuf};
+use std::process::Command;
+use std::thread;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+use portable_pty::{native_pty_system, Child, CommandBuilder, MasterPty, PtySize};
+
+fn unique_test_dir() -> PathBuf {
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    std::env::temp_dir().join(format!("herdr-cli-test-{}-{nanos}", std::process::id()))
+}
+
+struct SpawnedHerdr {
+    _master: Box<dyn MasterPty + Send>,
+    child: Box<dyn Child + Send + Sync>,
+}
+
+fn wait_for_socket(path: &Path, timeout: Duration) {
+    let deadline = Instant::now() + timeout;
+    while Instant::now() < deadline {
+        if path.exists() && std::os::unix::net::UnixStream::connect(path).is_ok() {
+            return;
+        }
+        thread::sleep(Duration::from_millis(25));
+    }
+    panic!("socket did not appear at {}", path.display());
+}
+
+fn spawn_herdr(config_home: &Path, runtime_dir: &Path, socket_path: &Path) -> SpawnedHerdr {
+    fs::create_dir_all(config_home.join("herdr")).unwrap();
+    fs::create_dir_all(runtime_dir).unwrap();
+    fs::write(
+        config_home.join("herdr/config.toml"),
+        "onboarding = false\n",
+    )
+    .unwrap();
+
+    let pair = native_pty_system()
+        .openpty(PtySize {
+            rows: 24,
+            cols: 80,
+            pixel_width: 0,
+            pixel_height: 0,
+        })
+        .unwrap();
+
+    let mut cmd = CommandBuilder::new(env!("CARGO_BIN_EXE_herdr"));
+    cmd.arg("--no-session");
+    cmd.env("XDG_CONFIG_HOME", config_home);
+    cmd.env("XDG_RUNTIME_DIR", runtime_dir);
+    cmd.env("HERDR_SOCKET_PATH", socket_path);
+    cmd.env_remove("HERDR_ENV");
+
+    let child = pair.slave.spawn_command(cmd).unwrap();
+    SpawnedHerdr {
+        _master: pair.master,
+        child,
+    }
+}
+
+fn run_cli(socket_path: &Path, args: &[&str]) -> std::process::Output {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_herdr"));
+    command.args(args);
+    command.env("HERDR_SOCKET_PATH", socket_path);
+    command.output().unwrap()
+}
+
+fn send_request(socket_path: &Path, json: &str) -> serde_json::Value {
+    let mut stream = UnixStream::connect(socket_path).unwrap();
+    stream.write_all(json.as_bytes()).unwrap();
+    stream.write_all(b"\n").unwrap();
+    stream.flush().unwrap();
+
+    let mut line = String::new();
+    let mut reader = BufReader::new(stream);
+    reader.read_line(&mut line).unwrap();
+    serde_json::from_str(&line).unwrap()
+}
+
+#[test]
+fn workspace_and_pane_management_commands_work() {
+    let base = unique_test_dir();
+    let config_home = base.join("config");
+    let runtime_dir = base.join("runtime");
+    let socket_path = runtime_dir.join("herdr.sock");
+
+    let mut herdr = spawn_herdr(&config_home, &runtime_dir, &socket_path);
+    wait_for_socket(&socket_path, Duration::from_secs(5));
+
+    let listed = run_cli(&socket_path, &["workspace", "list"]);
+    assert!(listed.status.success());
+    let listed_json: serde_json::Value = serde_json::from_slice(&listed.stdout).unwrap();
+    assert_eq!(listed_json["result"]["type"], "workspace_list");
+    assert_eq!(
+        listed_json["result"]["workspaces"]
+            .as_array()
+            .unwrap()
+            .len(),
+        0
+    );
+
+    let created = run_cli(
+        &socket_path,
+        &["workspace", "create", "--cwd", base.to_str().unwrap()],
+    );
+    assert!(created.status.success());
+    let created_json: serde_json::Value = serde_json::from_slice(&created.stdout).unwrap();
+    assert_eq!(created_json["result"]["workspace"]["workspace_id"], "w_1");
+
+    let panes = run_cli(&socket_path, &["pane", "list", "--workspace", "1"]);
+    assert!(panes.status.success());
+    let panes_json: serde_json::Value = serde_json::from_slice(&panes.stdout).unwrap();
+    assert_eq!(panes_json["result"]["panes"].as_array().unwrap().len(), 1);
+
+    let split = run_cli(
+        &socket_path,
+        &["pane", "split", "1-1", "--direction", "right"],
+    );
+    assert!(
+        split.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&split.stderr)
+    );
+    let split_json: serde_json::Value = serde_json::from_slice(&split.stdout).unwrap();
+    let split_pane_id = split_json["result"]["pane"]["pane_id"].as_str().unwrap();
+
+    let fetched = run_cli(&socket_path, &["pane", "get", split_pane_id]);
+    assert!(fetched.status.success());
+    let fetched_json: serde_json::Value = serde_json::from_slice(&fetched.stdout).unwrap();
+    assert_eq!(fetched_json["result"]["pane"]["pane_id"], split_pane_id);
+
+    let closed = run_cli(&socket_path, &["pane", "close", split_pane_id]);
+    assert!(closed.status.success());
+    let closed_json: serde_json::Value = serde_json::from_slice(&closed.stdout).unwrap();
+    assert_eq!(closed_json["result"]["type"], "ok");
+
+    let renamed = run_cli(&socket_path, &["workspace", "rename", "1", "demo"]);
+    assert!(renamed.status.success());
+    let renamed_json: serde_json::Value = serde_json::from_slice(&renamed.stdout).unwrap();
+    assert_eq!(renamed_json["result"]["workspace"]["label"], "demo");
+
+    let focused = run_cli(&socket_path, &["workspace", "focus", "1"]);
+    assert!(focused.status.success());
+
+    let closed_workspace = run_cli(&socket_path, &["workspace", "close", "1"]);
+    assert!(closed_workspace.status.success());
+    let closed_workspace_json: serde_json::Value =
+        serde_json::from_slice(&closed_workspace.stdout).unwrap();
+    assert_eq!(closed_workspace_json["result"]["type"], "ok");
+
+    let _ = herdr.child.kill();
+    let _ = herdr.child.wait();
+    let _ = fs::remove_dir_all(base);
+}
+
+#[test]
+fn pane_run_read_and_wait_commands_work() {
+    let base = unique_test_dir();
+    let config_home = base.join("config");
+    let runtime_dir = base.join("runtime");
+    let socket_path = runtime_dir.join("herdr.sock");
+
+    let mut herdr = spawn_herdr(&config_home, &runtime_dir, &socket_path);
+    wait_for_socket(&socket_path, Duration::from_secs(5));
+
+    let created = send_request(
+        &socket_path,
+        &format!(
+            r#"{{"id":"req_cli_1","method":"workspace.create","params":{{"cwd":"{}","focus":true}}}}"#,
+            base.display()
+        ),
+    );
+    assert_eq!(created["result"]["workspace"]["workspace_id"], "w_1");
+
+    let create = run_cli(
+        &socket_path,
+        &[
+            "pane",
+            "run",
+            "p_1_1",
+            "echo alpha && echo beta && printf 'ready\\n'",
+        ],
+    );
+    assert!(create.status.success());
+
+    let waited = run_cli(
+        &socket_path,
+        &[
+            "wait",
+            "output",
+            "1-1",
+            "--match",
+            "ready",
+            "--source",
+            "recent",
+            "--lines",
+            "40",
+            "--timeout",
+            "5000",
+        ],
+    );
+    assert!(
+        waited.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&waited.stderr)
+    );
+    let waited_json: serde_json::Value = serde_json::from_slice(&waited.stdout).unwrap();
+    assert_eq!(waited_json["result"]["type"], "output_matched");
+
+    let read = run_cli(
+        &socket_path,
+        &["pane", "read", "1-1", "--source", "recent", "--lines", "40"],
+    );
+    assert!(read.status.success());
+    let text = String::from_utf8(read.stdout).unwrap();
+    assert!(text.contains("alpha"));
+    assert!(text.contains("ready"));
+
+    let _ = herdr.child.kill();
+    let _ = herdr.child.wait();
+    let _ = fs::remove_dir_all(base);
+}
+
+#[test]
+fn wait_agent_state_exits_when_state_matches() {
+    let base = unique_test_dir();
+    let config_home = base.join("config");
+    let runtime_dir = base.join("runtime");
+    let socket_path = runtime_dir.join("herdr.sock");
+    let bin_dir = base.join("bin");
+
+    fs::create_dir_all(&bin_dir).unwrap();
+    let fake_pi = bin_dir.join("pi");
+    fs::write(
+        &fake_pi,
+        "#!/bin/sh\nprintf 'Working...\\n'\nsleep 1\nprintf '\\033[2J\\033[Hdone\\n'\n",
+    )
+    .unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut perms = fs::metadata(&fake_pi).unwrap().permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&fake_pi, perms).unwrap();
+    }
+
+    let pair = native_pty_system()
+        .openpty(PtySize {
+            rows: 24,
+            cols: 80,
+            pixel_width: 0,
+            pixel_height: 0,
+        })
+        .unwrap();
+    fs::create_dir_all(config_home.join("herdr")).unwrap();
+    fs::create_dir_all(&runtime_dir).unwrap();
+    fs::write(
+        config_home.join("herdr/config.toml"),
+        "onboarding = false\n",
+    )
+    .unwrap();
+    let mut cmd = CommandBuilder::new(env!("CARGO_BIN_EXE_herdr"));
+    cmd.arg("--no-session");
+    cmd.env("XDG_CONFIG_HOME", &config_home);
+    cmd.env("XDG_RUNTIME_DIR", &runtime_dir);
+    cmd.env("HERDR_SOCKET_PATH", &socket_path);
+    cmd.env_remove("HERDR_ENV");
+    cmd.env(
+        "PATH",
+        format!(
+            "{}:{}",
+            bin_dir.display(),
+            std::env::var("PATH").unwrap_or_default()
+        ),
+    );
+    let child = pair.slave.spawn_command(cmd).unwrap();
+    let mut herdr = SpawnedHerdr {
+        _master: pair.master,
+        child,
+    };
+
+    wait_for_socket(&socket_path, Duration::from_secs(5));
+
+    let created = send_request(
+        &socket_path,
+        &format!(
+            r#"{{"id":"req_cli_2","method":"workspace.create","params":{{"cwd":"{}","focus":true}}}}"#,
+            base.display()
+        ),
+    );
+    assert_eq!(created["result"]["workspace"]["workspace_id"], "w_1");
+
+    let start_pi = run_cli(&socket_path, &["pane", "run", "1-1", "pi"]);
+    assert!(start_pi.status.success());
+
+    let waited = run_cli(
+        &socket_path,
+        &[
+            "wait",
+            "agent-state",
+            "1-1",
+            "--state",
+            "idle",
+            "--timeout",
+            "5000",
+        ],
+    );
+    assert!(
+        waited.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&waited.stderr)
+    );
+    let waited_json: serde_json::Value = serde_json::from_slice(&waited.stdout).unwrap();
+    assert_eq!(waited_json["event"], "pane.agent_state_changed");
+    assert_eq!(waited_json["data"]["state"], "idle");
+    assert_eq!(waited_json["data"]["agent"], "pi");
+
+    let _ = herdr.child.kill();
+    let _ = herdr.child.wait();
+    let _ = fs::remove_dir_all(base);
+}

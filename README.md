@@ -192,7 +192,7 @@ see [`SOCKET_API.md`](./SOCKET_API.md) for request shapes, examples, and subscri
 - **notification hooks**: richer agent/script-side state reporting on top of the socket foundation, so unsupported tools can report status directly to herdr.
 - **in-app preferences**: rerun onboarding and adjust things like sound and toast notifications without editing config by hand.
 - **native notifications**: OS-level notifications when an agent needs attention and herdr isn't in focus.
-- **agent cli wrapper**: `herdr pane ...`, `herdr wait ...`, and similar shell-friendly commands layered on top of the socket API.
+- **expanded cli wrapper**: more shell-friendly commands on top of the socket API, especially broader workspace/pane management and streaming event wrappers.
 
 ## built with agents
 
@@ -204,21 +204,37 @@ there will be rough edges. if you hit one, [open an issue](https://github.com/og
 
 ## cli
 
-current built-in commands:
+built-in commands:
 
-```
-herdr                   launch herdr
-herdr update            download and install the latest version
-herdr --version         print version
-herdr --default-config  print default configuration
-herdr --no-session      start without restoring or saving sessions
-herdr --help            show help
+```text
+herdr                                   launch herdr
+herdr update                            download and install the latest version
+herdr workspace list                    list workspaces
+herdr workspace create ...              create a workspace
+herdr workspace get <workspace>         inspect one workspace
+herdr workspace focus <workspace>       focus a workspace
+herdr workspace rename <workspace> ...  rename a workspace
+herdr workspace close <workspace>       close a workspace
+herdr pane list ...                     list panes
+herdr pane get <pane>                   inspect one pane
+herdr pane read <pane> ...              read pane output
+herdr pane split <pane> ...             split a pane
+herdr pane close <pane>                 close a pane
+herdr pane send-text <pane> <text>      send text without submitting
+herdr pane send-keys <pane> <keys...>   send keypresses like Enter
+herdr pane run <pane> <command>         send text and press Enter
+herdr wait output <pane> ...            block until output matches
+herdr wait agent-state <pane> ...       block until pane reaches a state
+herdr --version                         print version
+herdr --default-config                  print default configuration
+herdr --no-session                      start without restoring or saving sessions
+herdr --help                            show help
 ```
 
-programmatic control today lives in the socket API:
+pane ids can be passed either as socket ids like `p_1_1` or in a shorter human form like `1-1`.
+
+these commands are thin wrappers over the socket API:
 - [`SOCKET_API.md`](./SOCKET_API.md)
-
-shell-friendly wrapper commands like `herdr pane ...` and `herdr wait ...` are planned on top of that API.
 
 ## building from source
 

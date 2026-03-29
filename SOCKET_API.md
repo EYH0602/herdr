@@ -349,12 +349,26 @@ example pushed `pane.agent_state_changed` event:
 
 recommended architecture:
 - socket api = foundational integration protocol
-- future `herdr ...` commands = ergonomic wrapper for humans and coding agents
+- `herdr ...` commands = ergonomic wrapper for humans and coding agents
 
-for agent workflows, the future CLI should likely expose blocking commands like:
+current wrapper commands include:
+- `herdr workspace list`
+- `herdr workspace create ...`
+- `herdr workspace get ...`
+- `herdr workspace focus ...`
+- `herdr workspace rename ...`
+- `herdr workspace close ...`
+- `herdr pane list ...`
+- `herdr pane get ...`
 - `herdr pane read ...`
+- `herdr pane split ...`
+- `herdr pane close ...`
+- `herdr pane send-text ...`
+- `herdr pane send-keys ...`
 - `herdr pane run ...`
 - `herdr wait output ...`
 - `herdr wait agent-state ...`
 
-but those should sit on top of this socket surface rather than replacing it.
+those commands sit on top of this socket surface rather than replacing it.
+
+for convenience, the CLI accepts pane ids in either raw socket form (`p_1_1`) or short human form (`1-1`).
