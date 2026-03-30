@@ -1,3 +1,8 @@
+---
+name: herdr
+description: "Control herdr from inside it. Split panes, spawn agents, read output, wait for state changes, and manage workspaces — all via CLI commands that talk to the running herdr instance over a local unix socket. Use when running inside herdr (HERDR_ENV=1)."
+---
+
 # herdr — agent skill
 
 you are running inside herdr, a terminal-native agent multiplexer. herdr gives you workspaces and panes — each pane is a real terminal with its own shell, agent, server, or log stream — and you can control all of it from the cli.
