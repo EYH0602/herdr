@@ -35,6 +35,15 @@ pub struct Workspace {
     pub(crate) render_dirty: Arc<AtomicBool>,
 }
 
+impl Drop for Workspace {
+    fn drop(&mut self) {
+        let runtimes = std::mem::take(&mut self.runtimes);
+        for (pane_id, runtime) in runtimes {
+            runtime.shutdown(pane_id);
+        }
+    }
+}
+
 impl Workspace {
     pub fn new(
         initial_cwd: PathBuf,
@@ -111,12 +120,27 @@ impl Workspace {
     /// Close the focused pane. Returns the removed pane id, or None if last pane.
     pub fn close_focused(&mut self) -> Option<PaneId> {
         let pane_id = self.layout.focused();
-        self.remove_pane(pane_id)
+        self.close_pane(pane_id)
     }
 
-    /// Remove a specific pane from this workspace.
+    /// Close a specific pane and terminate everything running inside it.
+    /// Returns None if it's the last pane and the whole workspace should close.
+    pub fn close_pane(&mut self, pane_id: PaneId) -> Option<PaneId> {
+        let (removed, runtime) = self.detach_pane(pane_id)?;
+        if let Some(runtime) = runtime {
+            runtime.shutdown(pane_id);
+        }
+        Some(removed)
+    }
+
+    /// Remove a specific pane from this workspace without terminating its runtime.
+    /// Used when the pane process has already exited and we are only cleaning up state.
     /// Returns None if it's the last pane and the whole workspace should close.
     pub fn remove_pane(&mut self, pane_id: PaneId) -> Option<PaneId> {
+        self.detach_pane(pane_id).map(|(removed, _)| removed)
+    }
+
+    fn detach_pane(&mut self, pane_id: PaneId) -> Option<(PaneId, Option<PaneRuntime>)> {
         if self.layout.pane_count() <= 1 {
             return None;
         }
@@ -141,12 +165,12 @@ impl Workspace {
             self.next_public_pane_number = self.public_pane_numbers.len() + 1;
         }
         self.panes.remove(&pane_id);
-        self.runtimes.remove(&pane_id);
+        let runtime = self.runtimes.remove(&pane_id);
         self.zoomed = false;
         if let Some(next_root) = next_root {
             self.root_pane = next_root;
         }
-        Some(pane_id)
+        Some((pane_id, runtime))
     }
 
     fn promoted_root_if_needed(&self, closing: PaneId) -> Option<PaneId> {

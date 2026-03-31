@@ -1100,7 +1100,7 @@ impl App {
                         data: crate::api::schema::EventData::WorkspaceClosed { workspace_id },
                     });
                 } else {
-                    ws.remove_pane(pane_id);
+                    ws.close_pane(pane_id);
                     self.emit_event(crate::api::schema::EventEnvelope {
                         event: crate::api::schema::EventKind::PaneClosed,
                         data: crate::api::schema::EventData::PaneClosed {

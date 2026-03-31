@@ -160,7 +160,74 @@ fn recent_text_from_parser(parser: &mut vt100::Parser<PtyResponses>, lines: usiz
     }
 }
 
+fn wait_for_processes_to_exit(pids: &[u32], timeout: std::time::Duration) -> bool {
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        if pids
+            .iter()
+            .all(|pid| !crate::platform::process_exists(*pid))
+        {
+            return true;
+        }
+        if std::time::Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+}
+
+fn shutdown_pane_processes(pane_id: PaneId, child_pid: u32) {
+    if child_pid == 0 {
+        return;
+    }
+
+    let mut pids = crate::platform::session_processes(child_pid);
+    if pids.is_empty() {
+        pids.push(child_pid);
+    }
+    pids.sort_unstable();
+    pids.dedup();
+
+    for (signal, grace) in [
+        (
+            crate::platform::Signal::Hangup,
+            std::time::Duration::from_millis(250),
+        ),
+        (
+            crate::platform::Signal::Terminate,
+            std::time::Duration::from_millis(250),
+        ),
+        (
+            crate::platform::Signal::Kill,
+            std::time::Duration::from_millis(250),
+        ),
+    ] {
+        crate::platform::signal_processes(&pids, signal);
+        if wait_for_processes_to_exit(&pids, grace) {
+            info!(
+                pane = pane_id.raw(),
+                pid = child_pid,
+                ?signal,
+                "pane session terminated"
+            );
+            return;
+        }
+    }
+
+    warn!(
+        pane = pane_id.raw(),
+        pid = child_pid,
+        pids = ?pids,
+        "pane session still alive after forced shutdown"
+    );
+}
+
 impl PaneRuntime {
+    pub fn shutdown(self, pane_id: PaneId) {
+        self.detect_handle.abort();
+        shutdown_pane_processes(pane_id, self.child_pid.load(Ordering::Acquire));
+    }
+
     pub fn spawn(
         pane_id: PaneId,
         rows: u16,

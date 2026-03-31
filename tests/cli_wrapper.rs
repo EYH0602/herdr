@@ -71,6 +71,26 @@ fn run_cli(socket_path: &Path, args: &[&str]) -> std::process::Output {
     command.output().unwrap()
 }
 
+fn process_exists(pid: u32) -> bool {
+    let result = unsafe { libc::kill(pid as i32, 0) };
+    if result == 0 {
+        true
+    } else {
+        std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+    }
+}
+
+fn wait_for_pid_exit(pid: u32, timeout: Duration) -> bool {
+    let deadline = Instant::now() + timeout;
+    while Instant::now() < deadline {
+        if !process_exists(pid) {
+            return true;
+        }
+        thread::sleep(Duration::from_millis(25));
+    }
+    !process_exists(pid)
+}
+
 fn send_request(socket_path: &Path, json: &str) -> serde_json::Value {
     let mut stream = UnixStream::connect(socket_path).unwrap();
     stream.write_all(json.as_bytes()).unwrap();
@@ -221,6 +241,128 @@ fn pane_run_read_and_wait_commands_work() {
     let text = String::from_utf8(read.stdout).unwrap();
     assert!(text.contains("alpha"));
     assert!(text.contains("ready"));
+
+    let _ = herdr.child.kill();
+    let _ = herdr.child.wait();
+    let _ = fs::remove_dir_all(base);
+}
+
+#[test]
+fn closing_pane_terminates_processes_inside_it() {
+    let base = unique_test_dir();
+    let config_home = base.join("config");
+    let runtime_dir = base.join("runtime");
+    let socket_path = runtime_dir.join("herdr.sock");
+
+    let mut herdr = spawn_herdr(&config_home, &runtime_dir, &socket_path);
+    wait_for_socket(&socket_path, Duration::from_secs(5));
+
+    let created = run_cli(
+        &socket_path,
+        &["workspace", "create", "--cwd", base.to_str().unwrap()],
+    );
+    assert!(created.status.success());
+
+    let split = run_cli(
+        &socket_path,
+        &["pane", "split", "1-1", "--direction", "right"],
+    );
+    assert!(split.status.success());
+    let split_json: serde_json::Value = serde_json::from_slice(&split.stdout).unwrap();
+    let pane_id = split_json["result"]["pane"]["pane_id"].as_str().unwrap();
+
+    let pid_file = base.join("pane-close.pid");
+    let command = format!(
+        "python3 -c 'import os,time,pathlib; pathlib.Path(r\"{}\").write_text(str(os.getpid())); time.sleep(1000)'",
+        pid_file.display()
+    );
+    let ran = run_cli(&socket_path, &["pane", "run", pane_id, &command]);
+    assert!(
+        ran.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&ran.stderr)
+    );
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < deadline && !pid_file.exists() {
+        thread::sleep(Duration::from_millis(25));
+    }
+    assert!(pid_file.exists(), "pid file was not created");
+
+    let pid: u32 = fs::read_to_string(&pid_file)
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    assert!(process_exists(pid), "child process was not running");
+
+    let closed = run_cli(&socket_path, &["pane", "close", pane_id]);
+    assert!(
+        closed.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&closed.stderr)
+    );
+    assert!(
+        wait_for_pid_exit(pid, Duration::from_secs(3)),
+        "process {pid} survived pane close"
+    );
+
+    let _ = herdr.child.kill();
+    let _ = herdr.child.wait();
+    let _ = fs::remove_dir_all(base);
+}
+
+#[test]
+fn closing_workspace_terminates_processes_inside_it() {
+    let base = unique_test_dir();
+    let config_home = base.join("config");
+    let runtime_dir = base.join("runtime");
+    let socket_path = runtime_dir.join("herdr.sock");
+
+    let mut herdr = spawn_herdr(&config_home, &runtime_dir, &socket_path);
+    wait_for_socket(&socket_path, Duration::from_secs(5));
+
+    let created = run_cli(
+        &socket_path,
+        &["workspace", "create", "--cwd", base.to_str().unwrap()],
+    );
+    assert!(created.status.success());
+
+    let pid_file = base.join("workspace-close.pid");
+    let command = format!(
+        "python3 -c 'import os,time,pathlib; pathlib.Path(r\"{}\").write_text(str(os.getpid())); time.sleep(1000)'",
+        pid_file.display()
+    );
+    let ran = run_cli(&socket_path, &["pane", "run", "1-1", &command]);
+    assert!(
+        ran.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&ran.stderr)
+    );
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < deadline && !pid_file.exists() {
+        thread::sleep(Duration::from_millis(25));
+    }
+    assert!(pid_file.exists(), "pid file was not created");
+
+    let pid: u32 = fs::read_to_string(&pid_file)
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    assert!(process_exists(pid), "child process was not running");
+
+    let closed = run_cli(&socket_path, &["workspace", "close", "1"]);
+    assert!(
+        closed.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&closed.stderr)
+    );
+    assert!(
+        wait_for_pid_exit(pid, Duration::from_secs(3)),
+        "process {pid} survived workspace close"
+    );
 
     let _ = herdr.child.kill();
     let _ = herdr.child.wait();

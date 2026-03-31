@@ -2,7 +2,7 @@ use std::ffi::OsStr;
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 
-use super::{ForegroundJob, ForegroundProcess};
+use super::{ForegroundJob, ForegroundProcess, Signal};
 
 /// Collect the foreground terminal job for a given child PID.
 pub fn foreground_job(child_pid: u32) -> Option<ForegroundJob> {
@@ -283,4 +283,63 @@ pub fn process_cwd(pid: u32) -> Option<PathBuf> {
         return None;
     }
     Some(PathBuf::from(OsStr::from_bytes(&vip_path[..nul])))
+}
+
+pub fn session_processes(child_pid: u32) -> Vec<u32> {
+    if child_pid == 0 {
+        return Vec::new();
+    }
+
+    let target_session = unsafe { libc::getsid(child_pid as libc::c_int) };
+    if target_session <= 0 {
+        return Vec::new();
+    }
+
+    let mut pids = vec![0i32; 4096];
+    let bytes = unsafe {
+        libc::proc_listallpids(
+            pids.as_mut_ptr() as *mut libc::c_void,
+            (pids.len() * std::mem::size_of::<i32>()) as libc::c_int,
+        )
+    };
+    if bytes <= 0 {
+        return Vec::new();
+    }
+
+    let count = (bytes as usize) / std::mem::size_of::<i32>();
+    pids.into_iter()
+        .take(count)
+        .filter(|pid| *pid > 0)
+        .filter(|pid| unsafe { libc::getsid(*pid) } == target_session)
+        .map(|pid| pid as u32)
+        .collect()
+}
+
+pub fn signal_processes(pids: &[u32], signal: Signal) {
+    let sig = match signal {
+        Signal::Hangup => libc::SIGHUP,
+        Signal::Terminate => libc::SIGTERM,
+        Signal::Kill => libc::SIGKILL,
+    };
+
+    for &pid in pids {
+        if pid == 0 {
+            continue;
+        }
+        unsafe {
+            libc::kill(pid as libc::c_int, sig);
+        }
+    }
+}
+
+pub fn process_exists(pid: u32) -> bool {
+    if pid == 0 {
+        return false;
+    }
+    let result = unsafe { libc::kill(pid as libc::c_int, 0) };
+    if result == 0 {
+        true
+    } else {
+        std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+    }
 }

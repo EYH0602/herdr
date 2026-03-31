@@ -1,6 +1,6 @@
 use std::path::PathBuf;
 
-use super::{ForegroundJob, ForegroundProcess};
+use super::{ForegroundJob, ForegroundProcess, Signal};
 
 /// Collect the foreground terminal job for a given child PID.
 pub fn foreground_job(child_pid: u32) -> Option<ForegroundJob> {
@@ -86,4 +86,65 @@ pub fn process_cwd(pid: u32) -> Option<PathBuf> {
         return None;
     }
     std::fs::read_link(format!("/proc/{pid}/cwd")).ok()
+}
+
+pub fn session_processes(child_pid: u32) -> Vec<u32> {
+    let Some(session_id) = process_session_id(child_pid) else {
+        return Vec::new();
+    };
+
+    let mut pids = Vec::new();
+    for entry in std::fs::read_dir("/proc").into_iter().flatten().flatten() {
+        let file_name = entry.file_name();
+        let Some(pid_str) = file_name.to_str() else {
+            continue;
+        };
+        if !pid_str.bytes().all(|b| b.is_ascii_digit()) {
+            continue;
+        }
+
+        let Ok(pid) = pid_str.parse::<u32>() else {
+            continue;
+        };
+        if process_session_id(pid) == Some(session_id) {
+            pids.push(pid);
+        }
+    }
+    pids
+}
+
+pub fn signal_processes(pids: &[u32], signal: Signal) {
+    let sig = match signal {
+        Signal::Hangup => libc::SIGHUP,
+        Signal::Terminate => libc::SIGTERM,
+        Signal::Kill => libc::SIGKILL,
+    };
+
+    for &pid in pids {
+        if pid == 0 {
+            continue;
+        }
+        unsafe {
+            libc::kill(pid as i32, sig);
+        }
+    }
+}
+
+pub fn process_exists(pid: u32) -> bool {
+    if pid == 0 {
+        return false;
+    }
+    let result = unsafe { libc::kill(pid as i32, 0) };
+    if result == 0 {
+        true
+    } else {
+        std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+    }
+}
+
+fn process_session_id(pid: u32) -> Option<i32> {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    let rest = stat.get(stat.rfind(')')? + 2..)?;
+    let fields: Vec<&str> = rest.split_whitespace().collect();
+    fields.get(3)?.parse().ok()
 }

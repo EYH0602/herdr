@@ -17,6 +17,13 @@ pub struct ForegroundJob {
     pub processes: Vec<ForegroundProcess>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Signal {
+    Hangup,
+    Terminate,
+    Kill,
+}
+
 #[cfg(target_os = "linux")]
 mod linux;
 #[cfg(target_os = "linux")]
