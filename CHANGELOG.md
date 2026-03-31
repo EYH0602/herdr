@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## [0.2.3] - 2026-03-31
+
 ### Changed
 - Mouse wheel handling now follows the tmux/Ghostty model more closely: fullscreen apps receive wheel input when they own scrolling, while herdr keeps host scrollback for panes that are behaving like a normal terminal transcript.
 - Pane scrollbars now only appear when herdr has real host scrollback for that pane, instead of implying a host-managed scroll position for app-owned scrolling.
